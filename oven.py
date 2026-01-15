@@ -1,10 +1,11 @@
-# run_oven_pico.py
+# run_oven_pico.py  (DROP-IN REPLACEMENT FOR CSV PATH HANDLING)
 import sys
 import time
 import glob
 import math
 import csv
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -16,6 +17,48 @@ import pyqtgraph as pg
 from gpiozero.pins.rpigpio import RPiGPIOFactory
 from gpiozero import PWMOutputDevice, OutputDevice
 import serial
+
+
+# ============================================================
+# CSV / RESOURCE PATH HELPERS (NEW)
+# ============================================================
+def _bundle_base_dir() -> Path:
+    """
+    Returns a directory that is stable across:
+      - running as a .py file
+      - PyInstaller --onedir
+      - PyInstaller --onefile
+
+    Priority:
+      1) PyInstaller temp/unpack dir (sys._MEIPASS) for bundled resources
+      2) Directory of the executable (sys.executable) for external files next to the exe
+      3) Directory of this .py file for development
+    """
+    # PyInstaller onefile/onedir with bundled data: sys._MEIPASS exists
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            return Path(sys._MEIPASS).resolve()
+        except Exception:
+            pass
+
+    # If running as an executable, prefer the exe directory (for external CSV next to exe)
+    if getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            pass
+
+    # Development mode: directory of this source file
+    return Path(__file__).resolve().parent
+
+
+def resource_path(relative: str) -> Path:
+    """
+    Resolve a resource path from the bundle base dir.
+
+    This makes relative paths safe when launched from a desktop icon / different CWD.
+    """
+    return _bundle_base_dir() / relative
 
 
 # ============================================================
@@ -81,8 +124,9 @@ CONTROL_SENSOR_INDEX = 0
 
 # ---- Calibration LUT CSV ----
 # CSV columns expected: real_temp_c, thermometer0_c, thermometer1_c, thermometer2_c
-# Put your calibration file path here (or keep as relative if you run from same folder).
-CALIBRATION_CSV_PATH = "thermistor_calibration_20251230_184921.csv"
+# IMPORTANT: Now resolved robustly (works even when launched from Desktop / different CWD).
+CALIBRATION_CSV_FILENAME = "thermistor_calibration_20251230_184921.csv"
+CALIBRATION_CSV_PATH = str(resource_path(CALIBRATION_CSV_FILENAME))
 
 # If True: if LUT missing/unreadable, fall back to uncalibrated temps (still low-pass filtered).
 ALLOW_UNCALIBRATED_FALLBACK = True
@@ -189,7 +233,6 @@ def _interp_extrap(x: float, xp: list[float], yp: list[float]) -> float:
     return y0 + t * (y1 - y0)
 
 
-
 class ThermistorCalibrator:
     """
     Builds per-sensor mapping: measured thermistor temp -> real temp.
@@ -209,8 +252,6 @@ class ThermistorCalibrator:
             rows = []
             with open(self.csv_path, "r", newline="") as f:
                 reader = csv.DictReader(f)
-                # Expect these headers from your calibration script:
-                # real_temp_c, thermometer0_c, thermometer1_c, thermometer2_c
                 required = {"real_temp_c", "thermometer0_c", "thermometer1_c", "thermometer2_c"}
                 if not reader.fieldnames:
                     raise ValueError("CSV has no header row.")
@@ -240,7 +281,6 @@ class ThermistorCalibrator:
                     meas = [t0, t1, t2][i]
                     pairs.append((meas, real))
 
-                # sort by meas
                 pairs.sort(key=lambda p: p[0])
 
                 # collapse duplicate meas by averaging real
@@ -273,7 +313,6 @@ class ThermistorCalibrator:
             return meas_temp_c
         i = int(sensor_index)
         return _interp_extrap(meas_temp_c, self.xp[i], self.yp[i])
-
 
 
 # ============================================================
@@ -451,7 +490,7 @@ class ControlThread(QThread):
 
         self._ser = None
 
-        # Calibration
+        # Calibration (now uses robust path)
         self.cal = ThermistorCalibrator(CALIBRATION_CSV_PATH)
         if (not self.cal.ok) and (not ALLOW_UNCALIBRATED_FALLBACK):
             raise RuntimeError(self.cal.note)
@@ -573,7 +612,6 @@ class ControlThread(QThread):
                 total_elapsed_s = int(loop_start - wall_t0)
 
                 temps = self._read_latest_temps()
-                # CHANGE: Use average instead of CONTROL_SENSOR_INDEX
                 pv = self._get_average_pv(temps)
 
                 if math.isnan(pv):
@@ -597,15 +635,11 @@ class ControlThread(QThread):
                     self.fault.emit(f"Average temp out of bounds: {pv:.2f} °C")
                     return
 
-                if self._force_off:
-                    duty = 0.0
-                else:
-                    duty = self.pid.update(setpoint=self.initial_target_c, measurement=pv, t_now=loop_start)
+                duty = 0.0 if self._force_off else self.pid.update(
+                    setpoint=self.initial_target_c, measurement=pv, t_now=loop_start
+                )
 
-                if self._force_off:
-                    self.heater.value = 0.0
-                else:
-                    self.heater.value = float(max(0.0, min(1.0, duty)))
+                self.heater.value = 0.0 if self._force_off else float(max(0.0, min(1.0, duty)))
 
                 reached_initial = (pv >= (self.initial_target_c - INITIAL_BAND_C))
 
@@ -648,7 +682,6 @@ class ControlThread(QThread):
                 sp = self.profile.sp_c[idx] if self.profile.sp_c else 0.0
 
                 temps = self._read_latest_temps()
-                # CHANGE: Use average instead of CONTROL_SENSOR_INDEX
                 pv = self._get_average_pv(temps)
 
                 if math.isnan(pv):
@@ -661,15 +694,8 @@ class ControlThread(QThread):
                     self.fault.emit(f"Average temp out of bounds: {pv:.2f} °C")
                     break
 
-                if self._force_off:
-                    duty = 0.0
-                else:
-                    duty = self.pid.update(setpoint=sp, measurement=pv, t_now=loop_start)
-
-                if self._force_off:
-                    self.heater.value = 0.0
-                else:
-                    self.heater.value = float(max(0.0, min(1.0, duty)))
+                duty = 0.0 if self._force_off else self.pid.update(setpoint=sp, measurement=pv, t_now=loop_start)
+                self.heater.value = 0.0 if self._force_off else float(max(0.0, min(1.0, duty)))
 
                 done = (elapsed_profile_s >= self.profile.total_s)
 
@@ -684,74 +710,6 @@ class ControlThread(QThread):
                     "duty": duty,
                     "done": done,
                     "note": f"{self.cal.note} (using AVG of sensors)"
-                })
-
-                if done:
-                    self.force_heater_off()
-                    break
-
-                period = 1.0 / CONTROL_LOOP_HZ
-                time.sleep(max(0.0, period - (time.time() - loop_start)))
-
-            if not self._running:
-                self.force_heater_off()
-                return
-
-            # Reset PID before main cycle
-            self.pid.reset()
-
-            # -------------------------
-            # Phase B: main profile
-            # -------------------------
-            profile_start = time.time()
-            idx = 0
-
-            while self._running:
-                loop_start = time.time()
-                total_elapsed_s = int(loop_start - wall_t0)
-                elapsed_profile_s = int(loop_start - profile_start)
-
-                while (idx + 1 < len(self.profile.t_s)) and (elapsed_profile_s >= self.profile.t_s[idx + 1]):
-                    idx += 1
-
-                sp = self.profile.sp_c[idx] if self.profile.sp_c else 0.0
-
-                temps = self._read_latest_temps()
-                pv = float(temps[CONTROL_SENSOR_INDEX])
-
-                if math.isnan(pv):
-                    self.force_heater_off()
-                    self.fault.emit("Lost Pico temperature data (PV is NaN) — heater forced OFF")
-                    break
-
-                if pv > TEMP_MAX_C or pv < TEMP_MIN_C:
-                    self.force_heater_off()
-                    self.fault.emit(f"Temperature out of bounds: {pv:.2f} °C (heater forced OFF)")
-                    break
-
-                if self._force_off:
-                    duty = 0.0
-                else:
-                    duty = self.pid.update(setpoint=sp, measurement=pv, t_now=loop_start)
-
-                if self._force_off:
-                    self.heater.value = 0.0
-                else:
-                    self.heater.value = float(max(0.0, min(1.0, duty)))
-
-                done = (elapsed_profile_s >= self.profile.total_s)
-
-                self.update.emit({
-                    "stage": "profile",
-                    "t_total_s": total_elapsed_s,
-                    "t_stage_s": elapsed_profile_s,
-                    "setpoint_c": sp,
-                    "actual_c": pv,
-                    "temps_c": temps,
-                    "forced_off": self._force_off,
-                    "duty": duty,
-                    "done": done,
-                    "note": f"{self.cal.note} | LPF tau={TEMP_LP_TAU_S}s"
                 })
 
                 if done:
