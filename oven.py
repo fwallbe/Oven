@@ -1,4 +1,4 @@
-# run_oven_pico.py  (DROP-IN REPLACEMENT FOR CSV PATH HANDLING)
+# run_oven_pico.py  (DROP-IN REPLACEMENT WITH LOW MEMORY PLOTTING)
 import sys
 import time
 import glob
@@ -6,6 +6,7 @@ import math
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from collections import deque  # NEW
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -34,30 +35,23 @@ def _bundle_base_dir() -> Path:
       2) Directory of the executable (sys.executable) for external files next to the exe
       3) Directory of this .py file for development
     """
-    # PyInstaller onefile/onedir with bundled data: sys._MEIPASS exists
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         try:
             return Path(sys._MEIPASS).resolve()
         except Exception:
             pass
 
-    # If running as an executable, prefer the exe directory (for external CSV next to exe)
     if getattr(sys, "frozen", False):
         try:
             return Path(sys.executable).resolve().parent
         except Exception:
             pass
 
-    # Development mode: directory of this source file
     return Path(__file__).resolve().parent
 
 
 def resource_path(relative: str) -> Path:
-    """
-    Resolve a resource path from the bundle base dir.
-
-    This makes relative paths safe when launched from a desktop icon / different CWD.
-    """
+    """Resolve a resource path from the bundle base dir."""
     return _bundle_base_dir() / relative
 
 
@@ -67,7 +61,13 @@ def resource_path(relative: str) -> Path:
 
 # ---- Frequencies / timing ----
 CONTROL_LOOP_HZ = 30.0            # sensor read + PID compute frequency (Hz)
-PROFILE_MAP_HZ = 1.0             # setpoint map resolution (Hz)
+PROFILE_MAP_HZ = 1.0              # setpoint map resolution (Hz)
+
+# NEW: GUI plot update frequency (Hz)
+PLOT_HZ = 0.5                     # 0.5 Hz => redraw every 2 seconds
+
+# NEW: history window in minutes (bounded memory)
+HISTORY_WINDOW_MIN = 30.0         # keep last N minutes in RAM for plotting
 
 # PWM frequency for heater output (SSR recommended; do NOT use with a mechanical relay)
 HEATER_PWM_HZ = 30.0
@@ -84,9 +84,9 @@ TEMP_MIN_C = 0.0
 TEMP_MAX_C = 140.0
 
 # ---- PID control parameters ----
-PID_KP = 0.22                     # proportional gain
-PID_KI = 0.03                    # integral gain (per second)
-PID_KD = 0.0                     # derivative gain (per second)
+PID_KP = 0.22
+PID_KI = 0.03
+PID_KD = 0.0
 
 PID_OUTPUT_MIN = 0.0             # interpreted as duty request [0..1]
 PID_OUTPUT_MAX = 1.0
@@ -115,23 +115,18 @@ NTC_BETA_K = 3950.0              # Beta (K)
 NTC_T0_K = 25.0 + 273.15         # 25C in Kelvin
 
 # Wiring assumption:
-# True  => 3.3V -> R_FIXED -> ADC node -> NTC -> GND
-# False => 3.3V -> NTC -> ADC node -> R_FIXED -> GND
 DIVIDER_PULLUP = True
 
 # Which sensor drives the controller PV (0,1,2)
 CONTROL_SENSOR_INDEX = 0
 
 # ---- Calibration LUT CSV ----
-# CSV columns expected: real_temp_c, thermometer0_c, thermometer1_c, thermometer2_c
-# IMPORTANT: Now resolved robustly (works even when launched from Desktop / different CWD).
 CALIBRATION_CSV_FILENAME = "thermistor_calibration_20251230_184921.csv"
 CALIBRATION_CSV_PATH = str(resource_path(CALIBRATION_CSV_FILENAME))
 
-# If True: if LUT missing/unreadable, fall back to uncalibrated temps (still low-pass filtered).
 ALLOW_UNCALIBRATED_FALLBACK = True
 
-# ---- Low-pass filter for temperature readings (same as calibration tool) ----
+# ---- Low-pass filter for temperature readings ----
 TEMP_LP_TAU_S = 5.0              # seconds (2..10 typical)
 
 
@@ -165,10 +160,8 @@ def volts_to_r_therm(v: float) -> float:
     v = max(1e-6, min(VREF - 1e-6, v))
 
     if DIVIDER_PULLUP:
-        # Vout = Vref * (R_th / (R_fixed + R_th))  =>  R_th = R_fixed * Vout / (Vref - Vout)
         return R_FIXED_OHM * v / (VREF - v)
     else:
-        # Vout = Vref * (R_fixed / (R_fixed + R_th))  =>  R_th = R_fixed * (Vref - Vout) / Vout
         return R_FIXED_OHM * (VREF - v) / v
 
 
@@ -189,14 +182,9 @@ def adc_to_temp_c(adc: int) -> float:
 # Calibration LUT + interpolation
 # ============================================================
 def _interp_extrap(x: float, xp: list[float], yp: list[float]) -> float:
-    """
-    Linear interpolation y(x) with linear extrapolation outside endpoints.
-    xp must be sorted ascending and have at least 2 points.
-    """
     if not xp or not yp or len(xp) != len(yp) or len(xp) < 2:
         return float("nan")
 
-    # Extrapolate below range using first segment
     if x <= xp[0]:
         x0, x1 = xp[0], xp[1]
         y0, y1 = yp[0], yp[1]
@@ -205,7 +193,6 @@ def _interp_extrap(x: float, xp: list[float], yp: list[float]) -> float:
             return y0
         return y0 + (x - x0) * (y1 - y0) / dx
 
-    # Extrapolate above range using last segment
     if x >= xp[-1]:
         x0, x1 = xp[-2], xp[-1]
         y0, y1 = yp[-2], yp[-1]
@@ -214,7 +201,6 @@ def _interp_extrap(x: float, xp: list[float], yp: list[float]) -> float:
             return y1
         return y1 + (x - x1) * (y1 - y0) / dx
 
-    # Interpolate inside range
     lo = 0
     hi = len(xp) - 1
     while hi - lo > 1:
@@ -234,17 +220,12 @@ def _interp_extrap(x: float, xp: list[float], yp: list[float]) -> float:
 
 
 class ThermistorCalibrator:
-    """
-    Builds per-sensor mapping: measured thermistor temp -> real temp.
-    For each sensor i: xp_i = sorted(measured temps), yp_i = real temps.
-    """
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
         self.ok = False
         self.note = ""
-        self.xp = [[], [], []]  # measured temps
-        self.yp = [[], [], []]  # real temps
-
+        self.xp = [[], [], []]
+        self.yp = [[], [], []]
         self._load()
 
     def _load(self):
@@ -274,7 +255,6 @@ class ThermistorCalibrator:
             if len(rows) < 2:
                 raise ValueError("Need at least 2 calibration rows to interpolate.")
 
-            # Build mapping per sensor: sort by measured temperature
             for i in range(3):
                 pairs = []
                 for (real, t0, t1, t2) in rows:
@@ -283,7 +263,6 @@ class ThermistorCalibrator:
 
                 pairs.sort(key=lambda p: p[0])
 
-                # collapse duplicate meas by averaging real
                 collapsed_x = []
                 collapsed_y = []
                 k = 0
@@ -362,7 +341,6 @@ def build_profile(
     t_s: list[int] = []
     sp: list[float] = []
 
-    # Phase 1: ramp
     temp = start_temp_c
     direction = 1.0 if hold_temp_c >= start_temp_c else -1.0
     rate = ramp_c_per_s * direction
@@ -384,14 +362,12 @@ def build_profile(
     sp[-1] = quantize_temp(hold_temp_c)
     temp = hold_temp_c
 
-    # Phase 2: hold
     hold_s = int(round(hold_time_min * 60))
     for _ in range(hold_s):
         t += 1.0
         t_s.append(int(round(t)))
         sp.append(quantize_temp(temp))
 
-    # Phase 3: soak
     direction2 = 1.0 if end_temp_c >= temp else -1.0
     rate2 = soak_c_per_s * direction2
 
@@ -473,7 +449,6 @@ class ControlThread(QThread):
         self._running = True
         self._force_off = False
 
-        # PWM output: value in [0..1]
         self.heater = PWMOutputDevice(
             HEATER_GPIO_BCM,
             active_high=True,
@@ -490,16 +465,12 @@ class ControlThread(QThread):
 
         self._ser = None
 
-        # Calibration (now uses robust path)
         self.cal = ThermistorCalibrator(CALIBRATION_CSV_PATH)
         if (not self.cal.ok) and (not ALLOW_UNCALIBRATED_FALLBACK):
             raise RuntimeError(self.cal.note)
 
-        # Filter state (on calibrated temps)
         self._lp = [float("nan"), float("nan"), float("nan")]
-        self._lp_last_t = None  # wall time
-
-        # last output temps to GUI (filtered, calibrated)
+        self._lp_last_t = None
         self._last_temps = [float("nan"), float("nan"), float("nan")]
 
     def stop(self):
@@ -541,10 +512,6 @@ class ControlThread(QThread):
         return self._lp
 
     def _read_latest_temps(self):
-        """
-        Returns temps after:
-          ADC->temp (model) -> calibration LUT (interp) -> low-pass filter
-        """
         if self._ser is None:
             return self._last_temps
 
@@ -575,14 +542,12 @@ class ControlThread(QThread):
         if not got_any or last_raw_model is None:
             return self._last_temps
 
-        # calibration (measured->real)
         t_cal = [
             self.cal.calibrate(last_raw_model[0], 0),
             self.cal.calibrate(last_raw_model[1], 1),
             self.cal.calibrate(last_raw_model[2], 2),
         ]
 
-        # low-pass filter on calibrated temps
         now_t = time.time()
         t_filt = self._apply_lowpass(t_cal, now_t)
 
@@ -590,7 +555,6 @@ class ControlThread(QThread):
         return self._last_temps
 
     def _get_average_pv(self, temps):
-        """Helper to calculate average of available sensors for PID control"""
         valid_temps = [t for t in temps if not math.isnan(t)]
         if not valid_temps:
             return float("nan")
@@ -603,9 +567,6 @@ class ControlThread(QThread):
         try:
             self._open_pico()
 
-            # -------------------------
-            # Phase A: initial heat-up
-            # -------------------------
             reached_initial = False
             while self._running and not reached_initial:
                 loop_start = time.time()
@@ -640,7 +601,6 @@ class ControlThread(QThread):
                 )
 
                 self.heater.value = 0.0 if self._force_off else float(max(0.0, min(1.0, duty)))
-
                 reached_initial = (pv >= (self.initial_target_c - INITIAL_BAND_C))
 
                 self.update.emit({
@@ -665,9 +625,6 @@ class ControlThread(QThread):
 
             self.pid.reset()
 
-            # -------------------------
-            # Phase B: main profile
-            # -------------------------
             profile_start = time.time()
             idx = 0
 
@@ -742,11 +699,9 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Pi Temperature Profile Controller (Pico ADC NTC + PID + PWM)")
 
-        # Fan relay device (ON/OFF)
         self.fans = OutputDevice(FANS_GPIO_BCM, active_high=FANS_RELAY_ACTIVE_HIGH, initial_value=False)
         self.fans_on = False
 
-        # Inputs
         self.initial_temp = QDoubleSpinBox()
         self.initial_temp.setRange(-50.0, 200.0)
         self.initial_temp.setValue(25.0)
@@ -763,11 +718,9 @@ class MainWindow(QWidget):
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setEnabled(False)
 
-        # Fan toggle button
         self.btn_fans = QPushButton("Fans: OFF")
         self.btn_fans.setMinimumHeight(40)
 
-        # BIG emergency off button
         self.btn_emergency_off = QPushButton("⛔ EMERGENCY HEATER OFF")
         self.btn_emergency_off.setMinimumHeight(70)
         self.btn_emergency_off.setStyleSheet("""
@@ -783,39 +736,40 @@ class MainWindow(QWidget):
         """)
 
         self.lbl_status = QLabel(
-            f"Status: idle | heaterGPIO={HEATER_GPIO_BCM} | fansGPIO={FANS_GPIO_BCM} | loop={CONTROL_LOOP_HZ}Hz | PWM={HEATER_PWM_HZ}Hz | PV=sensor{CONTROL_SENSOR_INDEX}"
-            f" | cal={CALIBRATION_CSV_PATH} | LPF tau={TEMP_LP_TAU_S}s"
+            f"Status: idle | heaterGPIO={HEATER_GPIO_BCM} | fansGPIO={FANS_GPIO_BCM} | loop={CONTROL_LOOP_HZ}Hz | PWM={HEATER_PWM_HZ}Hz"
+            f" | cal={CALIBRATION_CSV_PATH} | LPF tau={TEMP_LP_TAU_S}s | plot={PLOT_HZ}Hz | window={HISTORY_WINDOW_MIN}min"
         )
         self.lbl_now = QLabel("stage=-- | t=-- min | SP=-- °C | PV=-- °C | avg=-- °C | T0/T1/T2=--/--/-- | heater=-- | duty=--")
 
-        # Plot
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget()
         self.plot.setLabel("bottom", "Time (min)")
         self.plot.setLabel("left", "Temperature (°C)")
         self.plot.addLegend()
 
-        # Curves (thickness only)
         self.curve_sp = self.plot.plot([], [], name="Setpoint", pen=pg.mkPen(width=3))
         self.curve_avg = self.plot.plot([], [], name="Average", pen=pg.mkPen(width=2))
-
         self.curve_t0 = self.plot.plot([], [], name="Temp sensor0 (cal+LPF)", pen=pg.mkPen(width=1))
         self.curve_t1 = self.plot.plot([], [], name="Temp sensor1 (cal+LPF)", pen=pg.mkPen(width=1))
         self.curve_t2 = self.plot.plot([], [], name="Temp sensor2 (cal+LPF)", pen=pg.mkPen(width=1))
-
         self.curve_pv = self.plot.plot([], [], name=f"PV (sensor{CONTROL_SENSOR_INDEX})", pen=pg.mkPen(width=1))
 
-        # Data buffers (history only up to "now")
-        self.profile: Profile | None = None
-        self.hist_t_min: list[float] = []
-        self.hist_sp: list[float] = []
-        self.hist_avg: list[float] = []
-        self.hist_pv: list[float] = []
-        self.hist_t0: list[float] = []
-        self.hist_t1: list[float] = []
-        self.hist_t2: list[float] = []
+        # NEW: bounded ring buffers (deques)
+        max_samples = max(10, int(HISTORY_WINDOW_MIN * 60.0 * CONTROL_LOOP_HZ))
+        self.hist_t_min = deque(maxlen=max_samples)
+        self.hist_sp    = deque(maxlen=max_samples)
+        self.hist_avg   = deque(maxlen=max_samples)
+        self.hist_pv    = deque(maxlen=max_samples)
+        self.hist_t0    = deque(maxlen=max_samples)
+        self.hist_t1    = deque(maxlen=max_samples)
+        self.hist_t2    = deque(maxlen=max_samples)
 
-        # Layout
+        # NEW: redraw throttling
+        self._last_plot_update_t = 0.0
+        self._plot_period_s = 1.0 / max(1e-6, float(PLOT_HZ))
+
+        self.profile: Profile | None = None
+
         controls = QGroupBox("Profile Settings")
         c_layout = QVBoxLayout()
 
@@ -837,7 +791,6 @@ class MainWindow(QWidget):
         btns.addWidget(self.btn_start)
         btns.addWidget(self.btn_stop)
         c_layout.addLayout(btns)
-
         controls.setLayout(c_layout)
 
         layout = QVBoxLayout()
@@ -849,7 +802,6 @@ class MainWindow(QWidget):
         layout.addWidget(self.plot)
         self.setLayout(layout)
 
-        # Wiring
         self.btn_generate.clicked.connect(self.on_generate)
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
@@ -895,6 +847,8 @@ class MainWindow(QWidget):
         self.curve_t0.setData([], [])
         self.curve_t1.setData([], [])
         self.curve_t2.setData([], [])
+
+        self._last_plot_update_t = 0.0
 
     def on_emergency_off(self):
         if self.worker is not None:
@@ -957,6 +911,21 @@ class MainWindow(QWidget):
             self.worker.stop()
         self.lbl_status.setText("Status: stopping...")
 
+    def _maybe_redraw_plot(self):
+        now = time.time()
+        if (now - self._last_plot_update_t) < self._plot_period_s:
+            return
+        self._last_plot_update_t = now
+
+        # Convert deques to lists only at redraw rate (0.5Hz)
+        t = list(self.hist_t_min)
+        self.curve_sp.setData(t, list(self.hist_sp))
+        self.curve_avg.setData(t, list(self.hist_avg))
+        self.curve_pv.setData(t, list(self.hist_pv))
+        self.curve_t0.setData(t, list(self.hist_t0))
+        self.curve_t1.setData(t, list(self.hist_t1))
+        self.curve_t2.setData(t, list(self.hist_t2))
+
     def on_update(self, d: dict):
         stage = d.get("stage", "--")
         sp = float(d.get("setpoint_c", float("nan")))
@@ -966,16 +935,14 @@ class MainWindow(QWidget):
         forced = bool(d.get("forced_off", False))
         duty = float(d.get("duty", 0.0))
 
-        # time axis in minutes, using total runtime so the plot is continuous across stages
         t_total_s = int(d.get("t_total_s", 0))
         t_min = t_total_s / 60.0
 
-        # average (ignore NaNs)
         vals = [t0, t1, t2]
         good = [x for x in vals if not math.isnan(x)]
         avg = sum(good) / len(good) if good else float("nan")
 
-        # append history
+        # Append to bounded buffers (memory stays constant)
         self.hist_t_min.append(t_min)
         self.hist_sp.append(sp)
         self.hist_avg.append(avg)
@@ -984,14 +951,8 @@ class MainWindow(QWidget):
         self.hist_t1.append(t1)
         self.hist_t2.append(t2)
 
-        # plot (history only)
-        self.curve_sp.setData(self.hist_t_min, self.hist_sp)
-        self.curve_avg.setData(self.hist_t_min, self.hist_avg)
-
-        self.curve_pv.setData(self.hist_t_min, self.hist_pv)
-        self.curve_t0.setData(self.hist_t_min, self.hist_t0)
-        self.curve_t1.setData(self.hist_t_min, self.hist_t1)
-        self.curve_t2.setData(self.hist_t_min, self.hist_t2)
+        # Only redraw at PLOT_HZ
+        self._maybe_redraw_plot()
 
         heater_txt = "FORCED OFF" if forced else ("PWM")
         note = d.get("note", "")
@@ -1019,7 +980,6 @@ class MainWindow(QWidget):
         self.worker = None
 
     def closeEvent(self, event):
-        # Ensure fans OFF on exit
         try:
             self.fans.off()
         except Exception:
