@@ -1,4 +1,4 @@
-# run_oven_pico.py  (DROP-IN REPLACEMENT WITH LOW MEMORY PLOTTING)
+# run_oven_pico.py  (DROP-IN REPLACEMENT WITH OUTLIER REJECTION + LOW MEMORY PLOTTING)
 import sys
 import time
 import glob
@@ -128,6 +128,24 @@ ALLOW_UNCALIBRATED_FALLBACK = True
 
 # ---- Low-pass filter for temperature readings ----
 TEMP_LP_TAU_S = 5.0              # seconds (2..10 typical)
+
+# ---- NEW: Outlier rejection / plausibility checking ----
+OUTLIER_REJECTION_ENABLE = True
+
+# Hard plausible bounds (NOT your safety bounds) — used to reject obvious garbage spikes.
+# Keep this wide so you don't reject real values, but it should catch "impossible" readings.
+OUTLIER_ABS_MIN_C = -30.0
+OUTLIER_ABS_MAX_C = 250.0
+
+# Max physically plausible rate-of-change per sensor (°C/s).
+# If you have a small sensor and lots of airflow, you can increase; otherwise keep modest.
+OUTLIER_MAX_SLEW_C_PER_S = 3.0
+
+# Additional allowance for tiny dt situations (°C).
+OUTLIER_MAX_STEP_C = 8.0
+
+# If a new sample is rejected, reuse last good value for that sensor (instead of NaN)
+OUTLIER_HOLD_LAST_GOOD = True
 
 
 # ============================================================
@@ -473,6 +491,12 @@ class ControlThread(QThread):
         self._lp_last_t = None
         self._last_temps = [float("nan"), float("nan"), float("nan")]
 
+        # NEW: outlier rejection state
+        self._last_good_cal = [float("nan"), float("nan"), float("nan")]
+        self._last_good_t = None
+        self._reject_count_total = 0
+        self._reject_count_last = 0
+
     def stop(self):
         self._running = False
 
@@ -510,6 +534,67 @@ class ControlThread(QThread):
         self._lp = y
         self._lp_last_t = now_t
         return self._lp
+
+    # NEW: reject implausible spikes BEFORE low-pass filtering (prevents filter contamination)
+    def _reject_outliers(self, t_cal: list[float], now_t: float) -> list[float]:
+        self._reject_count_last = 0
+
+        if not OUTLIER_REJECTION_ENABLE:
+            # still track last_good for later (optional)
+            self._last_good_cal = list(t_cal)
+            self._last_good_t = now_t
+            return t_cal
+
+        cleaned = list(t_cal)
+
+        # If we don't yet have a reference timestamp, accept as-is and seed state
+        if self._last_good_t is None:
+            self._last_good_cal = list(t_cal)
+            self._last_good_t = now_t
+            return cleaned
+
+        dt = max(1e-6, now_t - self._last_good_t)
+
+        for i in range(3):
+            x = float(cleaned[i])
+
+            # NaNs: keep NaN (or hold last good if you prefer)
+            if math.isnan(x):
+                if OUTLIER_HOLD_LAST_GOOD and (not math.isnan(self._last_good_cal[i])):
+                    cleaned[i] = float(self._last_good_cal[i])
+                    self._reject_count_last += 1
+                continue
+
+            # Hard plausible bounds
+            if x < OUTLIER_ABS_MIN_C or x > OUTLIER_ABS_MAX_C:
+                if OUTLIER_HOLD_LAST_GOOD and (not math.isnan(self._last_good_cal[i])):
+                    cleaned[i] = float(self._last_good_cal[i])
+                else:
+                    cleaned[i] = float("nan")
+                self._reject_count_last += 1
+                continue
+
+            prev = float(self._last_good_cal[i])
+            if math.isnan(prev):
+                # No previous for this sensor: accept and seed
+                continue
+
+            # Slew / step constraint
+            max_allowed = (OUTLIER_MAX_SLEW_C_PER_S * dt) + OUTLIER_MAX_STEP_C
+            if abs(x - prev) > max_allowed:
+                if OUTLIER_HOLD_LAST_GOOD:
+                    cleaned[i] = prev
+                else:
+                    cleaned[i] = float("nan")
+                self._reject_count_last += 1
+                continue
+
+        # Update last-good state using the CLEANED values (so outliers don't become the new baseline)
+        self._last_good_cal = list(cleaned)
+        self._last_good_t = now_t
+
+        self._reject_count_total += self._reject_count_last
+        return cleaned
 
     def _read_latest_temps(self):
         if self._ser is None:
@@ -549,7 +634,12 @@ class ControlThread(QThread):
         ]
 
         now_t = time.time()
-        t_filt = self._apply_lowpass(t_cal, now_t)
+
+        # NEW: outlier rejection BEFORE low-pass filter
+        t_cal_clean = self._reject_outliers(t_cal, now_t)
+
+        # Filter the cleaned temps
+        t_filt = self._apply_lowpass(t_cal_clean, now_t)
 
         self._last_temps = list(t_filt)
         return self._last_temps
@@ -603,6 +693,7 @@ class ControlThread(QThread):
                 self.heater.value = 0.0 if self._force_off else float(max(0.0, min(1.0, duty)))
                 reached_initial = (pv >= (self.initial_target_c - INITIAL_BAND_C))
 
+                rej_note = f" | outlier_rej(last={self._reject_count_last}, total={self._reject_count_total})" if OUTLIER_REJECTION_ENABLE else ""
                 self.update.emit({
                     "stage": "initial",
                     "t_total_s": total_elapsed_s,
@@ -613,7 +704,7 @@ class ControlThread(QThread):
                     "forced_off": self._force_off,
                     "duty": duty,
                     "done": False,
-                    "note": f"{self.cal.note} (using AVG of sensors)"
+                    "note": f"{self.cal.note} (using AVG of sensors){rej_note}"
                 })
 
                 period = 1.0 / CONTROL_LOOP_HZ
@@ -656,6 +747,7 @@ class ControlThread(QThread):
 
                 done = (elapsed_profile_s >= self.profile.total_s)
 
+                rej_note = f" | outlier_rej(last={self._reject_count_last}, total={self._reject_count_total})" if OUTLIER_REJECTION_ENABLE else ""
                 self.update.emit({
                     "stage": "profile",
                     "t_total_s": total_elapsed_s,
@@ -666,7 +758,7 @@ class ControlThread(QThread):
                     "forced_off": self._force_off,
                     "duty": duty,
                     "done": done,
-                    "note": f"{self.cal.note} (using AVG of sensors)"
+                    "note": f"{self.cal.note} (using AVG of sensors){rej_note}"
                 })
 
                 if done:
@@ -738,6 +830,7 @@ class MainWindow(QWidget):
         self.lbl_status = QLabel(
             f"Status: idle | heaterGPIO={HEATER_GPIO_BCM} | fansGPIO={FANS_GPIO_BCM} | loop={CONTROL_LOOP_HZ}Hz | PWM={HEATER_PWM_HZ}Hz"
             f" | cal={CALIBRATION_CSV_PATH} | LPF tau={TEMP_LP_TAU_S}s | plot={PLOT_HZ}Hz | window={HISTORY_WINDOW_MIN}min"
+            f" | outlier_rej={'ON' if OUTLIER_REJECTION_ENABLE else 'OFF'} (slew={OUTLIER_MAX_SLEW_C_PER_S}°C/s, step={OUTLIER_MAX_STEP_C}°C)"
         )
         self.lbl_now = QLabel("stage=-- | t=-- min | SP=-- °C | PV=-- °C | avg=-- °C | T0/T1/T2=--/--/-- | heater=-- | duty=--")
 
