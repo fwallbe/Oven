@@ -1,9 +1,10 @@
-# run_oven_pico.py  (DROP-IN REPLACEMENT WITH OUTLIER REJECTION + LOW MEMORY PLOTTING)
+# run_oven_pico.py  (DROP-IN REPLACEMENT WITH OUTLIER REJECTION + LOW MEMORY PLOTTING + HOLD TEMP NUDGE BUTTONS)
 import sys
 import time
 import glob
 import math
 import csv
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from collections import deque  # NEW
@@ -138,7 +139,6 @@ OUTLIER_ABS_MIN_C = -30.0
 OUTLIER_ABS_MAX_C = 250.0
 
 # Max physically plausible rate-of-change per sensor (°C/s).
-# If you have a small sensor and lots of airflow, you can increase; otherwise keep modest.
 OUTLIER_MAX_SLEW_C_PER_S = 3.0
 
 # Additional allowance for tiny dt situations (°C).
@@ -146,6 +146,9 @@ OUTLIER_MAX_STEP_C = 8.0
 
 # If a new sample is rejected, reuse last good value for that sensor (instead of NaN)
 OUTLIER_HOLD_LAST_GOOD = True
+
+# ---- NEW: Hold temp nudge buttons (during HOLD only) ----
+HOLD_NUDGE_STEP_C = 1.0          # each click adjusts hold setpoint by this many °C
 
 
 # ============================================================
@@ -329,6 +332,8 @@ class Profile:
     t_s: list[int]
     sp_c: list[float]
     total_s: int
+    hold_start_s: int
+    hold_end_s: int
 
 
 def quantize_temp(x: float) -> float:
@@ -377,15 +382,21 @@ def build_profile(
         if t > 24 * 3600:
             raise ValueError("Ramp phase exceeded 24 hours — check rates/targets")
 
+    # Force the last ramp point to be exactly hold_temp
     sp[-1] = quantize_temp(hold_temp_c)
     temp = hold_temp_c
 
+    # Hold section (1 Hz in seconds)
+    hold_start_s = t_s[-1]
     hold_s = int(round(hold_time_min * 60))
+    hold_end_s = hold_start_s + hold_s
+
     for _ in range(hold_s):
         t += 1.0
         t_s.append(int(round(t)))
         sp.append(quantize_temp(temp))
 
+    # Soak to end (uses dt=1/PROFILE_MAP_HZ)
     direction2 = 1.0 if end_temp_c >= temp else -1.0
     rate2 = soak_c_per_s * direction2
 
@@ -404,7 +415,7 @@ def build_profile(
         sp[-1] = quantize_temp(end_temp_c)
 
     total_s = t_s[-1] if t_s else 0
-    return Profile(t_s=t_s, sp_c=sp, total_s=total_s)
+    return Profile(t_s=t_s, sp_c=sp, total_s=total_s, hold_start_s=hold_start_s, hold_end_s=hold_end_s)
 
 
 # ============================================================
@@ -491,11 +502,15 @@ class ControlThread(QThread):
         self._lp_last_t = None
         self._last_temps = [float("nan"), float("nan"), float("nan")]
 
-        # NEW: outlier rejection state
+        # Outlier rejection state
         self._last_good_cal = [float("nan"), float("nan"), float("nan")]
         self._last_good_t = None
         self._reject_count_total = 0
         self._reject_count_last = 0
+
+        # NEW: hold-temp offset that can be nudged from GUI (thread-safe)
+        self._hold_lock = threading.Lock()
+        self._hold_offset_c = 0.0  # applied ONLY during hold window
 
     def stop(self):
         self._running = False
@@ -507,6 +522,15 @@ class ControlThread(QThread):
             self.heater.off()
         except Exception:
             pass
+
+    # NEW: called from GUI thread
+    def adjust_hold(self, delta_c: float):
+        with self._hold_lock:
+            self._hold_offset_c += float(delta_c)
+
+    def _get_hold_offset(self) -> float:
+        with self._hold_lock:
+            return float(self._hold_offset_c)
 
     def _open_pico(self):
         port = find_pico_port()
@@ -535,19 +559,16 @@ class ControlThread(QThread):
         self._lp_last_t = now_t
         return self._lp
 
-    # NEW: reject implausible spikes BEFORE low-pass filtering (prevents filter contamination)
     def _reject_outliers(self, t_cal: list[float], now_t: float) -> list[float]:
         self._reject_count_last = 0
 
         if not OUTLIER_REJECTION_ENABLE:
-            # still track last_good for later (optional)
             self._last_good_cal = list(t_cal)
             self._last_good_t = now_t
             return t_cal
 
         cleaned = list(t_cal)
 
-        # If we don't yet have a reference timestamp, accept as-is and seed state
         if self._last_good_t is None:
             self._last_good_cal = list(t_cal)
             self._last_good_t = now_t
@@ -558,14 +579,12 @@ class ControlThread(QThread):
         for i in range(3):
             x = float(cleaned[i])
 
-            # NaNs: keep NaN (or hold last good if you prefer)
             if math.isnan(x):
                 if OUTLIER_HOLD_LAST_GOOD and (not math.isnan(self._last_good_cal[i])):
                     cleaned[i] = float(self._last_good_cal[i])
                     self._reject_count_last += 1
                 continue
 
-            # Hard plausible bounds
             if x < OUTLIER_ABS_MIN_C or x > OUTLIER_ABS_MAX_C:
                 if OUTLIER_HOLD_LAST_GOOD and (not math.isnan(self._last_good_cal[i])):
                     cleaned[i] = float(self._last_good_cal[i])
@@ -576,10 +595,8 @@ class ControlThread(QThread):
 
             prev = float(self._last_good_cal[i])
             if math.isnan(prev):
-                # No previous for this sensor: accept and seed
                 continue
 
-            # Slew / step constraint
             max_allowed = (OUTLIER_MAX_SLEW_C_PER_S * dt) + OUTLIER_MAX_STEP_C
             if abs(x - prev) > max_allowed:
                 if OUTLIER_HOLD_LAST_GOOD:
@@ -589,7 +606,6 @@ class ControlThread(QThread):
                 self._reject_count_last += 1
                 continue
 
-        # Update last-good state using the CLEANED values (so outliers don't become the new baseline)
         self._last_good_cal = list(cleaned)
         self._last_good_t = now_t
 
@@ -634,11 +650,7 @@ class ControlThread(QThread):
         ]
 
         now_t = time.time()
-
-        # NEW: outlier rejection BEFORE low-pass filter
         t_cal_clean = self._reject_outliers(t_cal, now_t)
-
-        # Filter the cleaned temps
         t_filt = self._apply_lowpass(t_cal_clean, now_t)
 
         self._last_temps = list(t_filt)
@@ -676,6 +688,9 @@ class ControlThread(QThread):
                         "forced_off": self._force_off,
                         "duty": 0.0,
                         "done": False,
+                        "in_hold": False,
+                        "hold_target_c": float("nan"),
+                        "hold_offset_c": 0.0,
                         "note": f"Waiting for Pico data... | {self.cal.note}"
                     })
                     time.sleep(0.1)
@@ -704,6 +719,9 @@ class ControlThread(QThread):
                     "forced_off": self._force_off,
                     "duty": duty,
                     "done": False,
+                    "in_hold": False,
+                    "hold_target_c": float("nan"),
+                    "hold_offset_c": 0.0,
                     "note": f"{self.cal.note} (using AVG of sensors){rej_note}"
                 })
 
@@ -727,7 +745,20 @@ class ControlThread(QThread):
                 while (idx + 1 < len(self.profile.t_s)) and (elapsed_profile_s >= self.profile.t_s[idx + 1]):
                     idx += 1
 
-                sp = self.profile.sp_c[idx] if self.profile.sp_c else 0.0
+                base_sp = self.profile.sp_c[idx] if self.profile.sp_c else 0.0
+
+                # NEW: apply hold nudging only during the HOLD window
+                in_hold = (elapsed_profile_s >= self.profile.hold_start_s) and (elapsed_profile_s <= self.profile.hold_end_s)
+                hold_offset = self._get_hold_offset() if in_hold else 0.0
+
+                sp = base_sp
+                if in_hold:
+                    sp = quantize_temp(base_sp + hold_offset)
+                    sp = max(TEMP_MIN_C, min(TEMP_MAX_C, sp))  # keep setpoint within safety bounds
+
+                    # If clamping prevented further motion, keep offset consistent so GUI display makes sense
+                    with self._hold_lock:
+                        self._hold_offset_c = sp - base_sp
 
                 temps = self._read_latest_temps()
                 pv = self._get_average_pv(temps)
@@ -758,6 +789,9 @@ class ControlThread(QThread):
                     "forced_off": self._force_off,
                     "duty": duty,
                     "done": done,
+                    "in_hold": in_hold,
+                    "hold_target_c": (sp if in_hold else float("nan")),
+                    "hold_offset_c": (self._get_hold_offset() if in_hold else 0.0),
                     "note": f"{self.cal.note} (using AVG of sensors){rej_note}"
                 })
 
@@ -827,10 +861,22 @@ class MainWindow(QWidget):
             QPushButton:pressed { background-color: #7a0016; }
         """)
 
+        # NEW: hold nudge controls
+        self.btn_hold_down = QPushButton("▼ Hold -")
+        self.btn_hold_up = QPushButton("▲ Hold +")
+        self.btn_hold_down.setEnabled(False)
+        self.btn_hold_up.setEnabled(False)
+        self.btn_hold_down.setMinimumHeight(40)
+        self.btn_hold_up.setMinimumHeight(40)
+
+        self.lbl_hold = QLabel("Hold adjust: --")
+        self.lbl_hold.setStyleSheet("font-weight: 700;")
+
         self.lbl_status = QLabel(
             f"Status: idle | heaterGPIO={HEATER_GPIO_BCM} | fansGPIO={FANS_GPIO_BCM} | loop={CONTROL_LOOP_HZ}Hz | PWM={HEATER_PWM_HZ}Hz"
             f" | cal={CALIBRATION_CSV_PATH} | LPF tau={TEMP_LP_TAU_S}s | plot={PLOT_HZ}Hz | window={HISTORY_WINDOW_MIN}min"
             f" | outlier_rej={'ON' if OUTLIER_REJECTION_ENABLE else 'OFF'} (slew={OUTLIER_MAX_SLEW_C_PER_S}°C/s, step={OUTLIER_MAX_STEP_C}°C)"
+            f" | hold_nudge_step={HOLD_NUDGE_STEP_C}°C"
         )
         self.lbl_now = QLabel("stage=-- | t=-- min | SP=-- °C | PV=-- °C | avg=-- °C | T0/T1/T2=--/--/-- | heater=-- | duty=--")
 
@@ -847,7 +893,7 @@ class MainWindow(QWidget):
         self.curve_t2 = self.plot.plot([], [], name="Temp sensor2 (cal+LPF)", pen=pg.mkPen(width=1))
         self.curve_pv = self.plot.plot([], [], name=f"PV (sensor{CONTROL_SENSOR_INDEX})", pen=pg.mkPen(width=1))
 
-        # NEW: bounded ring buffers (deques)
+        # bounded ring buffers (deques)
         max_samples = max(10, int(HISTORY_WINDOW_MIN * 60.0 * CONTROL_LOOP_HZ))
         self.hist_t_min = deque(maxlen=max_samples)
         self.hist_sp    = deque(maxlen=max_samples)
@@ -857,7 +903,7 @@ class MainWindow(QWidget):
         self.hist_t1    = deque(maxlen=max_samples)
         self.hist_t2    = deque(maxlen=max_samples)
 
-        # NEW: redraw throttling
+        # redraw throttling
         self._last_plot_update_t = 0.0
         self._plot_period_s = 1.0 / max(1e-6, float(PLOT_HZ))
 
@@ -886,10 +932,19 @@ class MainWindow(QWidget):
         c_layout.addLayout(btns)
         controls.setLayout(c_layout)
 
+        # NEW: Hold nudge group
+        hold_box = QGroupBox("Hold Nudge (active ONLY during HOLD phase)")
+        hold_layout = QHBoxLayout()
+        hold_layout.addWidget(self.btn_hold_down)
+        hold_layout.addWidget(self.btn_hold_up)
+        hold_layout.addWidget(self.lbl_hold)
+        hold_box.setLayout(hold_layout)
+
         layout = QVBoxLayout()
         layout.addWidget(self.btn_emergency_off)
         layout.addWidget(self.btn_fans)
         layout.addWidget(controls)
+        layout.addWidget(hold_box)
         layout.addWidget(self.lbl_status)
         layout.addWidget(self.lbl_now)
         layout.addWidget(self.plot)
@@ -901,7 +956,12 @@ class MainWindow(QWidget):
         self.btn_emergency_off.clicked.connect(self.on_emergency_off)
         self.btn_fans.clicked.connect(self.on_toggle_fans)
 
+        # NEW: hold nudge actions
+        self.btn_hold_down.clicked.connect(lambda: self.on_hold_nudge(-HOLD_NUDGE_STEP_C))
+        self.btn_hold_up.clicked.connect(lambda: self.on_hold_nudge(+HOLD_NUDGE_STEP_C))
+
         self.worker: ControlThread | None = None
+        self._in_hold_last = False
 
     def _set_fans_ui(self, on: bool):
         self.fans_on = bool(on)
@@ -964,7 +1024,8 @@ class MainWindow(QWidget):
             self._clear_history()
 
             self.lbl_status.setText(
-                f"Status: profile generated (preheat to {self.initial_temp.value():.1f} °C, main length {self.profile.total_s}s)"
+                f"Status: profile generated (preheat to {self.initial_temp.value():.1f} °C, "
+                f"hold window {self.profile.hold_start_s}s..{self.profile.hold_end_s}s, main length {self.profile.total_s}s)"
             )
 
         except Exception as e:
@@ -978,6 +1039,12 @@ class MainWindow(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_generate.setEnabled(False)
+
+        # Hold nudge buttons start disabled; they will enable automatically in HOLD phase
+        self.btn_hold_down.setEnabled(False)
+        self.btn_hold_up.setEnabled(False)
+        self.lbl_hold.setText("Hold adjust: waiting for HOLD phase...")
+        self._in_hold_last = False
 
         self._clear_history()
 
@@ -1004,13 +1071,19 @@ class MainWindow(QWidget):
             self.worker.stop()
         self.lbl_status.setText("Status: stopping...")
 
+    # NEW
+    def on_hold_nudge(self, delta_c: float):
+        if self.worker is None:
+            return
+        # Only meaningful during HOLD; thread will ignore outside HOLD anyway
+        self.worker.adjust_hold(delta_c)
+
     def _maybe_redraw_plot(self):
         now = time.time()
         if (now - self._last_plot_update_t) < self._plot_period_s:
             return
         self._last_plot_update_t = now
 
-        # Convert deques to lists only at redraw rate (0.5Hz)
         t = list(self.hist_t_min)
         self.curve_sp.setData(t, list(self.hist_sp))
         self.curve_avg.setData(t, list(self.hist_avg))
@@ -1044,12 +1117,29 @@ class MainWindow(QWidget):
         self.hist_t1.append(t1)
         self.hist_t2.append(t2)
 
-        # Only redraw at PLOT_HZ
         self._maybe_redraw_plot()
 
         heater_txt = "FORCED OFF" if forced else ("PWM")
         note = d.get("note", "")
         note_txt = f" | {note}" if note else ""
+
+        # NEW: manage HOLD nudge enable/disable + show current offset/target
+        in_hold = bool(d.get("in_hold", False))
+        hold_target = d.get("hold_target_c", float("nan"))
+        hold_offset = float(d.get("hold_offset_c", 0.0))
+
+        if in_hold != self._in_hold_last:
+            self.btn_hold_down.setEnabled(in_hold)
+            self.btn_hold_up.setEnabled(in_hold)
+            self._in_hold_last = in_hold
+
+        if in_hold and (not math.isnan(float(hold_target))):
+            self.lbl_hold.setText(
+                f"Hold adjust: offset {hold_offset:+.1f} °C | current hold target {float(hold_target):.1f} °C "
+                f"(step {HOLD_NUDGE_STEP_C:.1f} °C/click)"
+            )
+        else:
+            self.lbl_hold.setText("Hold adjust: (inactive) — buttons enable during HOLD phase only")
 
         self.lbl_now.setText(
             f"stage={stage} | t={t_min:>6.2f} min | SP={sp:>6.1f} °C | PV={pv:>6.2f} °C | avg={avg:>6.2f} °C"
@@ -1070,6 +1160,11 @@ class MainWindow(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_generate.setEnabled(True)
+
+        self.btn_hold_down.setEnabled(False)
+        self.btn_hold_up.setEnabled(False)
+        self.lbl_hold.setText("Hold adjust: --")
+
         self.worker = None
 
     def closeEvent(self, event):
@@ -1088,6 +1183,6 @@ class MainWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.resize(900, 650)
+    w.resize(900, 700)
     w.show()
     sys.exit(app.exec())
