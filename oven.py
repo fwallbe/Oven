@@ -835,7 +835,7 @@ class MainWindow(QWidget):
 
         self.ramp = QDoubleSpinBox(); self.ramp.setRange(0.1, 200.0); self.ramp.setValue(10.0); self.ramp.setSuffix(" °C/min")
         self.hold_temp = QDoubleSpinBox(); self.hold_temp.setRange(-50.0, 200.0); self.hold_temp.setValue(60.0); self.hold_temp.setSuffix(" °C")
-        self.hold_time = QDoubleSpinBox(); self.hold_time.setRange(0.0, 600.0); self.hold_time.setValue(10.0); self.hold_time.setSuffix(" min")
+        self.hold_time = QDoubleSpinBox(); self.hold_time.setRange(0.0, 999.0); self.hold_time.setValue(10.0); self.hold_time.setSuffix(" min")
         self.soak = QDoubleSpinBox(); self.soak.setRange(0.1, 200.0); self.soak.setValue(10.0); self.soak.setSuffix(" °C/min")
         self.end_temp = QDoubleSpinBox(); self.end_temp.setRange(-50.0, 200.0); self.end_temp.setValue(25.0); self.end_temp.setSuffix(" °C")
 
